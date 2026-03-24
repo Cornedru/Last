@@ -14,6 +14,7 @@ pub enum VmInstructionType {
     XorOp,
     AddOp,
     SubOp,
+    BitwiseOp,
     Jump,
     ConditionalJump,
     Return,
@@ -36,6 +37,7 @@ impl std::fmt::Display for VmInstructionType {
             VmInstructionType::XorOp => write!(f, "XOR_OP"),
             VmInstructionType::AddOp => write!(f, "ADD_OP"),
             VmInstructionType::SubOp => write!(f, "SUB_OP"),
+            VmInstructionType::BitwiseOp => write!(f, "BITWISE_OP"),
             VmInstructionType::Jump => write!(f, "JUMP"),
             VmInstructionType::ConditionalJump => write!(f, "CONDITIONAL_JUMP"),
             VmInstructionType::Return => write!(f, "RETURN"),
@@ -82,6 +84,9 @@ pub struct VmOpcodeAnalyzer<'a> {
     found_switch: Option<&'a SwitchStatement<'a>>,
     case_count: usize,
     state_props: StatePropertyNames,
+    discovered_memory_prop: Option<String>,
+    discovered_pointer_prop: Option<String>,
+    discovered_accumulator_prop: Option<String>,
 }
 
 impl<'a> VmOpcodeAnalyzer<'a> {
@@ -90,6 +95,9 @@ impl<'a> VmOpcodeAnalyzer<'a> {
             found_switch: None,
             case_count: 0,
             state_props: StatePropertyNames::default(),
+            discovered_memory_prop: None,
+            discovered_pointer_prop: None,
+            discovered_accumulator_prop: None,
         }
     }
 
@@ -588,78 +596,408 @@ impl<'a> VmOpcodeAnalyzer<'a> {
     }
 
     fn detect_state_properties(&mut self, switch_stmt: &'a SwitchStatement<'a>) {
-        let mut this_props: FxHashMap<String, usize> = FxHashMap::default();
+        let mut ptr_candidates: FxHashMap<String, usize> = FxHashMap::default();
+        let mut mem_candidates: FxHashMap<String, usize> = FxHashMap::default();
+        let mut acc_candidates: FxHashMap<String, usize> = FxHashMap::default();
 
         for case in &switch_stmt.cases {
             for stmt in &case.consequent {
-                self.extract_this_properties(stmt, &mut this_props);
+                self.find_local_pointer_increments(stmt, &mut ptr_candidates);
+                self.find_local_memory_access(stmt, &mut mem_candidates);
+                self.find_local_accumulator_usage(stmt, &mut acc_candidates);
             }
         }
 
-        for prop in ["h", "memory", "mem", "state", "data"] {
-            if this_props.contains_key(prop) {
-                self.state_props.memory_prop = Some(prop.to_string());
-                break;
-            }
+        eprintln!("[DEBUG] ptr_candidates: {:?}", ptr_candidates);
+        eprintln!("[DEBUG] mem_candidates: {:?}", mem_candidates);
+        eprintln!("[DEBUG] acc_candidates: {:?}", acc_candidates);
+
+        if let Some(ptr_name) = self.find_best_candidate(ptr_candidates) {
+            self.discovered_pointer_prop = Some(ptr_name.clone());
+            self.state_props.pointer_prop = Some(ptr_name);
+            eprintln!("[DEBUG] Discovered pointer: {}", ptr_name);
         }
 
-        for prop in ["g", "ptr", "pointer", "ip", "pc", "counter"] {
-            if this_props.contains_key(prop) {
-                self.state_props.pointer_prop = Some(prop.to_string());
-                break;
-            }
+        if let Some(mem_name) = self.find_best_candidate(mem_candidates) {
+            self.discovered_memory_prop = Some(mem_name.clone());
+            self.state_props.memory_prop = Some(mem_name.clone());
+            eprintln!("[DEBUG] Discovered memory: {}", mem_name);
         }
 
-        for prop in ["a", "acc", "accumulator", "result", "sum"] {
-            if this_props.contains_key(prop) {
-                self.state_props.accumulator_prop = Some(prop.to_string());
-                break;
-            }
+        if let Some(acc_name) = self.find_best_candidate(acc_candidates) {
+            self.discovered_accumulator_prop = Some(acc_name.clone());
+            self.state_props.accumulator_prop = Some(acc_name.clone());
+            eprintln!("[DEBUG] Discovered accumulator: {}", acc_name);
         }
     }
 
-    fn extract_this_properties(&self, stmt: &Statement, props: &mut FxHashMap<String, usize>) {
+    fn find_best_candidate(&self, mut candidates: FxHashMap<String, usize>) -> Option<String> {
+        candidates.retain(|_, &mut v| v > 0);
+        candidates.into_iter().max_by_key(|(_, v)| *v).map(|(k, _)| k)
+    }
+
+    fn find_local_pointer_increments(&self, stmt: &Statement, candidates: &mut FxHashMap<String, usize>) {
         match stmt {
             Statement::ExpressionStatement(expr_stmt) => {
-                self.extract_from_expr(&expr_stmt.expression, props);
-            }
-            Statement::IfStatement(if_stmt) => {
-                self.extract_from_expr(&if_stmt.test, props);
-                self.extract_this_properties(&if_stmt.consequent, props);
+                self.find_local_pointer_increments_expr(&expr_stmt.expression, candidates);
             }
             Statement::BlockStatement(block) => {
                 for s in &block.body {
-                    self.extract_this_properties(s, props);
+                    self.find_local_pointer_increments(s, candidates);
+                }
+            }
+            Statement::IfStatement(if_stmt) => {
+                self.find_local_pointer_increments(&if_stmt.consequent, candidates);
+            }
+            _ => {}
+        }
+    }
+
+    fn find_local_pointer_increments_expr(&self, expr: &Expression, candidates: &mut FxHashMap<String, usize>) {
+        match expr {
+            Expression::UpdateExpression(update) => {
+                if update.operator == UpdateOperator::Increment || update.operator == UpdateOperator::Decrement {
+                    if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &update.argument {
+                        *candidates.entry(id.name.to_string()).or_insert(0) += 10;
+                    } else if let SimpleAssignmentTarget::StaticMemberExpression(member) = &update.argument {
+                        if matches!(member.object, Expression::ThisExpression(_)) {
+                            *candidates.entry(member.property.name.to_string()).or_insert(0) += 10;
+                        }
+                    }
+                }
+            }
+            Expression::AssignmentExpression(assign) => {
+                if matches!(assign.operator, AssignmentOperator::Addition | AssignmentOperator::Subtraction) {
+                    if let Some(simple) = assign.left.as_simple_assignment_target() {
+                        match simple {
+                            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                                *candidates.entry(id.name.to_string()).or_insert(0) += 8;
+                            }
+                            SimpleAssignmentTarget::StaticMemberExpression(member) => {
+                                if matches!(member.object, Expression::ThisExpression(_)) {
+                                    *candidates.entry(member.property.name.to_string()).or_insert(0) += 8;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                self.find_local_pointer_increments_expr(&assign.right, candidates);
+            }
+            Expression::CallExpression(call) => {
+                for arg in &call.arguments {
+                    if let Some(e) = arg.as_expression() {
+                        self.find_local_pointer_increments_expr(e, candidates);
+                    }
+                }
+            }
+            Expression::SequenceExpression(seq) => {
+                for e in &seq.expressions {
+                    self.find_local_pointer_increments_expr(e, candidates);
                 }
             }
             _ => {}
         }
     }
 
-    fn extract_from_expr(&self, expr: &Expression, props: &mut FxHashMap<String, usize>) {
-        match expr {
-            Expression::AssignmentExpression(assign) => {
-                self.extract_from_expr(&assign.right, props);
+    fn find_local_memory_access(&self, stmt: &Statement, candidates: &mut FxHashMap<String, usize>) {
+        match stmt {
+            Statement::ExpressionStatement(expr_stmt) => {
+                self.find_local_memory_access_expr(&expr_stmt.expression, candidates);
             }
-            Expression::StaticMemberExpression(member) => {
-                if matches!(member.object, Expression::ThisExpression(_)) {
-                    *props.entry(member.property.name.to_string()).or_insert(0) += 1;
+            Statement::BlockStatement(block) => {
+                for s in &block.body {
+                    self.find_local_memory_access(s, candidates);
                 }
-                self.extract_from_expr(&member.object, props);
             }
-            Expression::ComputedMemberExpression(member) => {
-                self.extract_from_expr(&member.object, props);
-                self.extract_from_expr(&member.expression, props);
-            }
-            Expression::BinaryExpression(bin) => {
-                self.extract_from_expr(&bin.left, props);
-                self.extract_from_expr(&bin.right, props);
-            }
-            Expression::UnaryExpression(unary) => {
-                self.extract_from_expr(&unary.argument, props);
+            Statement::IfStatement(if_stmt) => {
+                self.find_local_memory_access(&if_stmt.consequent, candidates);
             }
             _ => {}
         }
+    }
+
+    fn find_local_memory_access_expr(&self, expr: &Expression, candidates: &mut FxHashMap<String, usize>) {
+        match expr {
+            Expression::ComputedMemberExpression(member) => {
+                if let Expression::Identifier(id) = &member.object {
+                    *candidates.entry(id.name.to_string()).or_insert(0) += 15;
+                }
+                self.find_local_memory_access_expr(&member.object, candidates);
+                self.find_local_memory_access_expr(&member.expression, candidates);
+            }
+            Expression::AssignmentExpression(assign) => {
+                self.find_local_memory_access_expr(&assign.right, candidates);
+            }
+            Expression::CallExpression(call) => {
+                for arg in &call.arguments {
+                    if let Some(e) = arg.as_expression() {
+                        self.find_local_memory_access_expr(e, candidates);
+                    }
+                }
+            }
+            Expression::SequenceExpression(seq) => {
+                for e in &seq.expressions {
+                    self.find_local_memory_access_expr(e, candidates);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn find_local_accumulator_usage(&self, stmt: &Statement, candidates: &mut FxHashMap<String, usize>) {
+        match stmt {
+            Statement::ExpressionStatement(expr_stmt) => {
+                self.find_local_accumulator_expr(&expr_stmt.expression, candidates);
+            }
+            Statement::BlockStatement(block) => {
+                for s in &block.body {
+                    self.find_local_accumulator_usage(s, candidates);
+                }
+            }
+            Statement::ReturnStatement(ret) => {
+                if let Some(arg) = &ret.argument {
+                    self.find_local_accumulator_expr(arg, candidates);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn find_local_accumulator_expr(&self, expr: &Expression, candidates: &mut FxHashMap<String, usize>) {
+        match expr {
+            Expression::AssignmentExpression(assign) => {
+                if let Some(simple) = assign.left.as_simple_assignment_target() {
+                    match simple {
+                        SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                            let is_complex = matches!(
+                                assign.right,
+                                Expression::BinaryExpression(_)
+                                | Expression::CallExpression(_)
+                                | Expression::ComputedMemberExpression(_)
+                            );
+                            let weight = if is_complex { 15 } else { 3 };
+                            *candidates.entry(id.name.to_string()).or_insert(0) += weight;
+                        }
+                        SimpleAssignmentTarget::StaticMemberExpression(member) => {
+                            if matches!(member.object, Expression::ThisExpression(_)) {
+                                *candidates.entry(member.property.name.to_string()).or_insert(0) += 15;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.find_local_accumulator_expr(&assign.right, candidates);
+            }
+            Expression::CallExpression(call) => {
+                for arg in &call.arguments {
+                    if let Some(e) = arg.as_expression() {
+                        self.find_local_accumulator_expr(e, candidates);
+                    }
+                }
+            }
+            Expression::SequenceExpression(seq) => {
+                for e in &seq.expressions {
+                    self.find_local_accumulator_expr(e, candidates);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn is_small_numeric(&self, expr: &Expression) -> bool {
+        match expr {
+            Expression::NumericLiteral(lit) => lit.value.abs() < 100.0,
+            Expression::UnaryExpression(unary) => {
+                if unary.operator == UnaryOperator::UnaryNegation {
+                    self.is_small_numeric(&unary.argument)
+                } else {
+                    false
+                }
+            }
+            _ => false
+        }
+    }
+
+    fn find_memory_array_access(&self, stmt: &Statement, candidates: &mut FxHashMap<String, usize>, ptr_name: Option<&String>) {
+        match stmt {
+            Statement::ExpressionStatement(expr_stmt) => {
+                self.find_memory_array_access_expr(&expr_stmt.expression, candidates, ptr_name);
+            }
+            Statement::BlockStatement(block) => {
+                for s in &block.body {
+                    self.find_memory_array_access(s, candidates, ptr_name);
+                }
+            }
+            Statement::IfStatement(if_stmt) => {
+                self.find_memory_array_access(&if_stmt.consequent, candidates, ptr_name);
+            }
+            _ => {}
+        }
+    }
+
+    fn find_memory_array_access_expr(&self, expr: &Expression, candidates: &mut FxHashMap<String, usize>, ptr_name: Option<&String>) {
+        match expr {
+            Expression::ComputedMemberExpression(member) => {
+                if let Expression::StaticMemberExpression(obj) = &member.object {
+                    if matches!(obj.object, Expression::ThisExpression(_)) {
+                        let mem_name = obj.property.name.to_string();
+                        if let Some(ptr) = ptr_name {
+                            if self.expr_contains_xor_with_ptr(&member.expression, ptr) {
+                                *candidates.entry(mem_name).or_insert(0) += 20;
+                            }
+                        } else {
+                            if self.contains_any_binary_expr(&member.expression) {
+                                *candidates.entry(mem_name).or_insert(0) += 5;
+                            }
+                        }
+                    }
+                }
+                self.find_memory_array_access_expr(&member.object, candidates, ptr_name);
+                self.find_memory_array_access_expr(&member.expression, candidates, ptr_name);
+            }
+            Expression::AssignmentExpression(assign) => {
+                self.find_memory_array_access_expr(&assign.right, candidates, ptr_name);
+            }
+            Expression::CallExpression(call) => {
+                for arg in &call.arguments {
+                    if let Some(e) = arg.as_expression() {
+                        self.find_memory_array_access_expr(e, candidates, ptr_name);
+                    }
+                }
+            }
+            Expression::SequenceExpression(seq) => {
+                for e in &seq.expressions {
+                    self.find_memory_array_access_expr(e, candidates, ptr_name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn expr_contains_xor_with_ptr(&self, expr: &Expression, ptr_name: &str) -> bool {
+        match expr {
+            Expression::BinaryExpression(bin) => {
+                if bin.operator == BinaryOperator::BitwiseXOR {
+                    let left_has_ptr = self.expr_has_this_property(&bin.left, ptr_name);
+                    let right_has_ptr = self.expr_has_this_property(&bin.right, ptr_name);
+                    return left_has_ptr || right_has_ptr;
+                }
+                self.expr_contains_xor_with_ptr(&bin.left, ptr_name) || 
+                self.expr_contains_xor_with_ptr(&bin.right, ptr_name)
+            }
+            _ => false
+        }
+    }
+
+    fn expr_has_this_property(&self, expr: &Expression, prop_name: &str) -> bool {
+        match expr {
+            Expression::StaticMemberExpression(member) => {
+                if matches!(member.object, Expression::ThisExpression(_)) {
+                    return member.property.name == prop_name;
+                }
+                self.expr_has_this_property(&member.object, prop_name)
+            }
+            Expression::ParenthesizedExpression(paren) => {
+                self.expr_has_this_property(&paren.expression, prop_name)
+            }
+            _ => false
+        }
+    }
+
+    fn contains_any_binary_expr(&self, expr: &Expression) -> bool {
+        match expr {
+            Expression::BinaryExpression(_) => true,
+            Expression::StaticMemberExpression(member) => {
+                self.contains_any_binary_expr(&member.object)
+            }
+            _ => false
+        }
+    }
+
+    fn find_accumulator_assignments(&self, stmt: &Statement, candidates: &mut FxHashMap<String, usize>) {
+        match stmt {
+            Statement::ExpressionStatement(expr_stmt) => {
+                self.find_accumulator_assignments_expr(&expr_stmt.expression, candidates);
+            }
+            Statement::BlockStatement(block) => {
+                for s in &block.body {
+                    self.find_accumulator_assignments(s, candidates);
+                }
+            }
+            Statement::IfStatement(if_stmt) => {
+                self.find_accumulator_assignments(&if_stmt.consequent, candidates);
+            }
+            _ => {}
+        }
+    }
+
+    fn find_accumulator_assignments_expr(&self, expr: &Expression, candidates: &mut FxHashMap<String, usize>) {
+        match expr {
+            Expression::AssignmentExpression(assign) => {
+                if let Some(simple) = assign.left.as_simple_assignment_target() {
+                    if let SimpleAssignmentTarget::StaticMemberExpression(member) = simple {
+                        if matches!(member.object, Expression::ThisExpression(_)) {
+                            let name = member.property.name.to_string();
+                            if self.expr_contains_memory_access(&assign.right) {
+                                *candidates.entry(name).or_insert(0) += 15;
+                            } else if self.is_literal(&assign.right) {
+                                *candidates.entry(name).or_insert(0) += 3;
+                            }
+                        }
+                    }
+                }
+                self.find_accumulator_assignments_expr(&assign.right, candidates);
+            }
+            Expression::CallExpression(call) => {
+                for arg in &call.arguments {
+                    if let Some(e) = arg.as_expression() {
+                        self.find_accumulator_assignments_expr(e, candidates);
+                    }
+                }
+            }
+            Expression::SequenceExpression(seq) => {
+                for e in &seq.expressions {
+                    self.find_accumulator_assignments_expr(e, candidates);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn expr_contains_memory_access(&self, expr: &Expression) -> bool {
+        match expr {
+            Expression::ComputedMemberExpression(_) => true,
+            Expression::StaticMemberExpression(member) => {
+                self.expr_contains_memory_access(&member.object)
+            }
+            Expression::BinaryExpression(bin) => {
+                self.expr_contains_memory_access(&bin.left) || self.expr_contains_memory_access(&bin.right)
+            }
+            Expression::UnaryExpression(unary) => {
+                self.expr_contains_memory_access(&unary.argument)
+            }
+            _ => false
+        }
+    }
+
+    fn is_literal(&self, expr: &Expression) -> bool {
+        matches!(
+            expr,
+            Expression::NumericLiteral(_) | Expression::StringLiteral(_) | Expression::BooleanLiteral(_)
+        )
+    }
+
+    fn find_best_pointer(&self, candidates: FxHashMap<String, usize>) -> Option<String> {
+        candidates.into_iter().max_by_key(|(_, count)| *count).map(|(name, _)| name)
+    }
+
+    fn find_best_memory(&self, candidates: FxHashMap<String, usize>) -> Option<String> {
+        candidates.into_iter().max_by_key(|(_, count)| *count).map(|(name, _)| name)
+    }
+
+    fn find_best_accumulator(&self, candidates: FxHashMap<String, usize>) -> Option<String> {
+        candidates.into_iter().max_by_key(|(_, count)| *count).map(|(name, _)| name)
     }
 
     fn map_opcodes(&self) -> VmOpcodeMapping {
@@ -706,6 +1044,34 @@ impl<'a> VmOpcodeAnalyzer<'a> {
         if flags.has_return {
             return VmInstructionType::Return;
         }
+
+        if flags.has_memory_write {
+            return VmInstructionType::MemoryWrite;
+        }
+
+        if flags.has_accumulator_write {
+            return VmInstructionType::MemoryWrite;
+        }
+
+        if flags.has_compound_assignment {
+            if let Some(op) = flags.compound_assignment_op {
+                match op {
+                    BinaryOperator::BitwiseXOR => return VmInstructionType::XorOp,
+                    BinaryOperator::Addition => return VmInstructionType::AddOp,
+                    BinaryOperator::Subtraction => return VmInstructionType::SubOp,
+                    _ => {}
+                }
+            }
+        }
+
+        if flags.has_memory_read {
+            return VmInstructionType::MemoryRead;
+        }
+
+        if flags.has_accumulator_read {
+            return VmInstructionType::MemoryRead;
+        }
+
         if flags.has_binary_op {
             if let Some(op) = flags.binary_op {
                 match op {
@@ -717,21 +1083,28 @@ impl<'a> VmOpcodeAnalyzer<'a> {
                     | BinaryOperator::Equality
                     | BinaryOperator::Inequality
                     | BinaryOperator::LessThan
-                    | BinaryOperator::LessEqualThan => {
+                    | BinaryOperator::LessEqualThan
+                    | BinaryOperator::GreaterThan
+                    | BinaryOperator::GreaterEqualThan => {
                         return VmInstructionType::Compare;
                     }
+                    BinaryOperator::ShiftLeft
+                    | BinaryOperator::ShiftRight
+                    | BinaryOperator::ShiftRightZeroFill => {
+                        return VmInstructionType::BitwiseOp;
+                    }
+                    BinaryOperator::BitwiseAnd => return VmInstructionType::BitwiseOp,
+                    BinaryOperator::BitwiseOR => return VmInstructionType::BitwiseOp,
+                    BinaryOperator::Remainder => return VmInstructionType::BitwiseOp,
+                    BinaryOperator::Multiplication => return VmInstructionType::BitwiseOp,
+                    BinaryOperator::Division => return VmInstructionType::BitwiseOp,
                     _ => {}
                 }
             }
         }
-        if flags.has_this_write && flags.has_member_access {
-            return VmInstructionType::MemoryWrite;
-        }
+
         if flags.has_jump {
             return VmInstructionType::Jump;
-        }
-        if flags.has_this_access && !flags.has_assignment {
-            return VmInstructionType::MemoryRead;
         }
 
         VmInstructionType::Unknown
@@ -745,7 +1118,7 @@ impl<'a> VmOpcodeAnalyzer<'a> {
             Statement::ReturnStatement(_ret) => {
                 flags.has_return = true;
             }
-            Statement::BreakStatement(_) | Statement::ContinueStatement(_) => {
+            Statement::BreakStatement(_) => {
                 flags.has_jump = true;
             }
             Statement::IfStatement(if_stmt) => {
@@ -764,55 +1137,121 @@ impl<'a> VmOpcodeAnalyzer<'a> {
     fn analyze_expr(&self, expr: &Expression, flags: &mut InstructionFlags) {
         match expr {
             Expression::AssignmentExpression(assign) => {
-                flags.has_assignment = true;
-                flags.has_binary_op = true;
-                if flags.binary_op.is_none() {
-                    match assign.operator {
-                        AssignmentOperator::BitwiseXOR => {
-                            flags.binary_op = Some(BinaryOperator::BitwiseXOR);
+                match assign.operator {
+                    AssignmentOperator::BitwiseXOR => {
+                        flags.has_compound_assignment = true;
+                        flags.compound_assignment_op = Some(BinaryOperator::BitwiseXOR);
+                        flags.has_binary_op = true;
+                        flags.binary_op = Some(BinaryOperator::BitwiseXOR);
+                    }
+                    AssignmentOperator::Addition => {
+                        flags.has_compound_assignment = true;
+                        flags.compound_assignment_op = Some(BinaryOperator::Addition);
+                        flags.has_binary_op = true;
+                        flags.binary_op = Some(BinaryOperator::Addition);
+                    }
+                    AssignmentOperator::Subtraction => {
+                        flags.has_compound_assignment = true;
+                        flags.compound_assignment_op = Some(BinaryOperator::Subtraction);
+                        flags.has_binary_op = true;
+                        flags.binary_op = Some(BinaryOperator::Subtraction);
+                    }
+                    _ => {}
+                }
+                
+                if let Some(simple) = assign.left.as_simple_assignment_target() {
+                    match simple {
+                        SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                            if let Some(ref mem_name) = self.discovered_memory_prop {
+                                if id.name == mem_name {
+                                    flags.has_memory_write = true;
+                                }
+                            }
+                            if let Some(ref acc_name) = self.discovered_accumulator_prop {
+                                if id.name == acc_name {
+                                    flags.has_accumulator_write = true;
+                                }
+                            }
                         }
-                        AssignmentOperator::Addition => {
-                            flags.binary_op = Some(BinaryOperator::Addition);
-                        }
-                        AssignmentOperator::Subtraction => {
-                            flags.binary_op = Some(BinaryOperator::Subtraction);
+                        SimpleAssignmentTarget::StaticMemberExpression(member) => {
+                            if matches!(member.object, Expression::ThisExpression(_)) {
+                                if let Some(ref mem_name) = self.discovered_memory_prop {
+                                    if member.property.name == mem_name {
+                                        flags.has_memory_write = true;
+                                    }
+                                }
+                                if let Some(ref acc_name) = self.discovered_accumulator_prop {
+                                    if member.property.name == acc_name {
+                                        flags.has_accumulator_write = true;
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }
                 }
+                
                 self.analyze_expr(&assign.right, flags);
             }
             Expression::BinaryExpression(bin) => {
                 flags.has_binary_op = true;
-                if flags.binary_op.is_none() {
+                if flags.binary_op.is_none() && !flags.has_compound_assignment {
                     flags.binary_op = Some(bin.operator);
                 }
                 self.analyze_expr(&bin.left, flags);
                 self.analyze_expr(&bin.right, flags);
             }
             Expression::StaticMemberExpression(member) => {
-                flags.has_member_access = true;
                 if matches!(member.object, Expression::ThisExpression(_)) {
-                    flags.has_this_access = true;
+                    if let Some(ref mem_name) = self.discovered_memory_prop {
+                        if member.property.name == mem_name {
+                            flags.has_memory_read = true;
+                        }
+                    }
+                    if let Some(ref acc_name) = self.discovered_accumulator_prop {
+                        if member.property.name == acc_name {
+                            flags.has_accumulator_read = true;
+                        }
+                    }
                 }
                 self.analyze_expr(&member.object, flags);
             }
             Expression::ComputedMemberExpression(member) => {
-                flags.has_member_access = true;
+                if let Expression::Identifier(id) = &member.object {
+                    if let Some(ref mem_name) = self.discovered_memory_prop {
+                        if id.name == mem_name {
+                            flags.has_memory_read = true;
+                        }
+                    }
+                }
                 self.analyze_expr(&member.object, flags);
                 self.analyze_expr(&member.expression, flags);
             }
-            Expression::ThisExpression(_) => {
-                flags.has_this_access = true;
-            }
             Expression::CallExpression(call) => {
                 self.analyze_expr(&call.callee, flags);
+                for arg in &call.arguments {
+                    if let Some(e) = arg.as_expression() {
+                        self.analyze_expr(e, flags);
+                    }
+                }
             }
-            Expression::UpdateExpression(_update) => {
-                flags.has_this_write = true;
+            Expression::UpdateExpression(update) => {
+                if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &update.argument {
+                    if let Some(ref ptr_name) = self.discovered_pointer_prop {
+                        if id.name == ptr_name {
+                        }
+                    }
+                    if let Some(ref acc_name) = self.discovered_accumulator_prop {
+                        if id.name == acc_name {
+                            flags.has_accumulator_write = true;
+                        }
+                    }
+                }
             }
-            Expression::UnaryExpression(unary) => {
-                self.analyze_expr(&unary.argument, flags);
+            Expression::SequenceExpression(seq) => {
+                for e in &seq.expressions {
+                    self.analyze_expr(e, flags);
+                }
             }
             Expression::ConditionalExpression(cond) => {
                 self.analyze_expr(&cond.test, flags);
@@ -822,18 +1261,93 @@ impl<'a> VmOpcodeAnalyzer<'a> {
             _ => {}
         }
     }
+
+    fn is_this_property(&self, member: &StaticMemberExpression, prop_name: &str) -> bool {
+        if matches!(member.object, Expression::ThisExpression(_)) {
+            return member.property.name == prop_name;
+        }
+        false
+    }
+
+    fn is_memory_array_access(&self, expr: &Expression) -> bool {
+        if let Expression::StaticMemberExpression(member) = expr {
+            if let Some(ref mem_name) = self.discovered_memory_prop {
+                return self.is_this_property(member, mem_name);
+            }
+        }
+        false
+    }
+
+    fn is_pointer_property(&self, member: &StaticMemberExpression) -> bool {
+        if let Some(ref ptr_name) = self.discovered_pointer_prop {
+            return self.is_this_property(member, ptr_name);
+        }
+        false
+    }
+
+    fn is_accumulator_property(&self, member: &StaticMemberExpression) -> bool {
+        if let Some(ref acc_name) = self.discovered_accumulator_prop {
+            return self.is_this_property(member, acc_name);
+        }
+        false
+    }
+
+    fn is_this_h_array_access(&self, expr: &Expression) -> bool {
+        if let Expression::StaticMemberExpression(member) = expr {
+            if let Some(ref mem_name) = self.discovered_memory_prop {
+                if member.property.name == mem_name {
+                    return true;
+                }
+            }
+            if member.property.name == "h" {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_member_expr_this_h_access(&self, member: &StaticMemberExpression) -> bool {
+        if let Some(ref mem_name) = self.discovered_memory_prop {
+            if member.property.name == mem_name {
+                return true;
+            }
+        }
+        if member.property.name == "h" {
+            return true;
+        }
+        false
+    }
+
+    fn assignment_target_is_this_h_write(&self, target: &AssignmentTarget) -> bool {
+        match target {
+            AssignmentTarget::StaticMemberExpression(member_expr) => {
+                if let Some(ref mem_name) = self.discovered_memory_prop {
+                    if member_expr.property.name == mem_name {
+                        return true;
+                    }
+                }
+                if member_expr.property.name == "h" {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
 }
 
 #[derive(Default)]
 struct InstructionFlags {
-    has_assignment: bool,
+    has_return: bool,
+    has_jump: bool,
     has_binary_op: bool,
     binary_op: Option<BinaryOperator>,
-    has_this_access: bool,
-    has_this_write: bool,
-    has_jump: bool,
-    has_return: bool,
-    has_member_access: bool,
+    has_compound_assignment: bool,
+    compound_assignment_op: Option<BinaryOperator>,
+    has_memory_write: bool,
+    has_memory_read: bool,
+    has_accumulator_write: bool,
+    has_accumulator_read: bool,
 }
 
 pub fn analyze_vm_opcodes(js_code: &str) -> Result<VmOpcodeMapping> {
